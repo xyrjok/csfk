@@ -4,6 +4,7 @@
  * [已合并] 增加查单密码、订单管理、规格自选标签
  * [购物车-升级版] 增加购物车合并下单接口、支付回调支持合并订单处理
  * [已修改] 将查单密码验证从6位改为1位
+ * [修复] 数据库导入逻辑，防止误删多行文本数据
  */
 
 // === 工具函数 ===
@@ -512,22 +513,15 @@ async function handleApi(request, env, url) {
                 });
             }
 
-            // 导入数据库 (Import)
+            // 导入数据库 (Import) - [已修复] 移除手动 split/filter 逻辑
             if (path === '/api/admin/db/import' && method === 'POST') {
                 const sqlContent = await request.text();
                 if (!sqlContent || !sqlContent.trim()) return errRes('SQL 文件内容为空');
 
                 try {
-                    const cleanSql = sqlContent
-                        .split('\n') // 按行分割
-                        .filter(line => {
-                            const trimLine = line.trim();
-                            // 保留非空行 且 不是以 -- 开头的注释行
-                            return trimLine !== '' && !trimLine.startsWith('--');
-                        })
-                        .join('\n'); // 重新合并
-                    
-                    await db.exec(cleanSql);
+                    // [关键修改] 直接执行原始 SQL，Cloudflare D1 支持处理标准 SQL 注释
+                    // 不要手动 split 换行符，否则会破坏多行文本数据 (如公告 HTML)
+                    await db.exec(sqlContent);
                     return jsonRes({ success: true });
                 } catch (e) {
                     return errRes('导入失败: ' + e.message);
