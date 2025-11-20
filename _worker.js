@@ -518,8 +518,16 @@ async function handleApi(request, env, url) {
                 if (!sqlContent || !sqlContent.trim()) return errRes('SQL 文件内容为空');
 
                 try {
-                    // 使用 db.exec() 执行多条 SQL 语句 (D1 原生支持)
-                    await db.exec(sqlContent);
+                    const cleanSql = sqlContent
+                        .split('\n') // 按行分割
+                        .filter(line => {
+                            const trimLine = line.trim();
+                            // 保留非空行 且 不是以 -- 开头的注释行
+                            return trimLine !== '' && !trimLine.startsWith('--');
+                        })
+                        .join('\n'); // 重新合并
+                    
+                    await db.exec(cleanSql);
                     return jsonRes({ success: true });
                 } catch (e) {
                     return errRes('导入失败: ' + e.message);
