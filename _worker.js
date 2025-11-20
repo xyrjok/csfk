@@ -4,7 +4,7 @@
  * [已合并] 增加查单密码、订单管理、规格自选标签
  * [购物车-升级版] 增加购物车合并下单接口、支付回调支持合并订单处理
  * [已修改] 将查单密码验证从6位改为1位
- * [修复] 数据库导入逻辑，防止误删多行文本数据
+ * [修复] 数据库导入逻辑：使用分片执行代替 exec，解决 D1 duration undefined 报错
  */
 
 // === 工具函数 ===
@@ -12,6 +12,60 @@ const jsonRes = (data, status = 200) => new Response(JSON.stringify(data), { sta
 const errRes = (msg, status = 400) => jsonRes({ error: msg }, status);
 const time = () => Math.floor(Date.now() / 1000);
 const uuid = () => crypto.randomUUID().replace(/-/g, '');
+
+/**
+ * [安全解析 SQL] 
+ * 将 SQL 字符串分割为语句数组，智能处理引号内的分号，并移除注释
+ */
+function safeSplitSql(sql) {
+    const stmts = [];
+    let current = "";
+    let inQuote = false;
+    let quoteChar = "";
+    let i = 0;
+    const len = sql.length;
+    
+    while(i < len) {
+        const char = sql[i];
+        
+        if (inQuote) {
+            current += char;
+            // 处理转义引号 (例如 'I''m')
+            if (char === quoteChar) {
+                if (i + 1 < len && sql[i+1] === quoteChar) {
+                    current += sql[i+1];
+                    i++; 
+                } else {
+                    inQuote = false;
+                }
+            }
+        } else {
+            // 检测并跳过注释 --
+            if (char === '-' && i + 1 < len && sql[i+1] === '-') {
+                i += 2;
+                // 跳过直到行尾
+                while(i < len && sql[i] !== '\n') i++;
+                continue;
+            }
+            
+            if (char === "'" || char === '"') {
+                inQuote = true;
+                quoteChar = char;
+                current += char;
+            } else if (char === ';') {
+                // 遇到分号且不在引号内，视为语句结束
+                if (current.trim()) stmts.push(current.trim());
+                current = "";
+            } else {
+                current += char;
+            }
+        }
+        i++;
+    }
+    // 添加最后一句（如果有）
+    if (current.trim()) stmts.push(current.trim());
+    return stmts;
+}
 
 // === 支付宝签名与验签核心 (Web Crypto API) ===
 
@@ -513,17 +567,35 @@ async function handleApi(request, env, url) {
                 });
             }
 
-            // 导入数据库 (Import) - [已修复] 移除手动 split/filter 逻辑
+            // 导入数据库 (Import) - [最终修复版]
             if (path === '/api/admin/db/import' && method === 'POST') {
                 const sqlContent = await request.text();
                 if (!sqlContent || !sqlContent.trim()) return errRes('SQL 文件内容为空');
 
                 try {
-                    // [关键修改] 直接执行原始 SQL，Cloudflare D1 支持处理标准 SQL 注释
-                    // 不要手动 split 换行符，否则会破坏多行文本数据 (如公告 HTML)
-                    await db.exec(sqlContent);
-                    return jsonRes({ success: true });
+                    // 1. 使用安全的解析器分割语句，并自动剔除注释
+                    const stmts = safeSplitSql(sqlContent);
+                    
+                    // 2. 过滤掉空语句 和 PRAGMA 语句 (PRAGMA 经常导致 D1 exec 报错)
+                    const validStmts = stmts.filter(s => {
+                        const u = s.toUpperCase();
+                        return s.length > 0 && !u.startsWith('PRAGMA');
+                    });
+
+                    if (validStmts.length === 0) return errRes('未解析到有效的 SQL 语句');
+
+                    // 3. 分批执行 (db.batch 单次限制，且比 exec 更稳定)
+                    const BATCH_SIZE = 20; 
+                    for (let i = 0; i < validStmts.length; i += BATCH_SIZE) {
+                        const batchSqls = validStmts.slice(i, i + BATCH_SIZE);
+                        // 将原始 SQL 字符串转换为 PreparedStatement
+                        const batchStmts = batchSqls.map(sql => db.prepare(sql));
+                        await db.batch(batchStmts);
+                    }
+
+                    return jsonRes({ success: true, count: validStmts.length });
                 } catch (e) {
+                    console.error("Import Error:", e);
                     return errRes('导入失败: ' + e.message);
                 }
             }
